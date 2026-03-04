@@ -27,3 +27,4 @@ docker run -p 8000:8000 -e API_KEYS=your-key novuscrape
 ## Auth
 
 Pass your API key via `X-Api-Key` header.
+
