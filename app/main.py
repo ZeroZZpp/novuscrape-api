@@ -2,7 +2,7 @@ import base64
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -72,10 +72,13 @@ async def health():
 @app.post("/scrape", response_model=ScrapeResponse)
 @limiter.limit(RATE_LIMIT)
 async def scrape(request: Request, body: ScrapeRequest, api_key: str = Depends(verify_api_key)):
-    if body.render_js:
-        html, status = await fetch_with_js(body.url, body.timeout, body.wait_for)
-    else:
-        html, status = await fetch_html(body.url, body.timeout)
+    try:
+        if body.render_js:
+            html, status = await fetch_with_js(body.url, body.timeout, body.wait_for)
+        else:
+            html, status = await fetch_html(body.url, body.timeout)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
 
     content, title = parse_html(html, body.output_format, body.url)
 
