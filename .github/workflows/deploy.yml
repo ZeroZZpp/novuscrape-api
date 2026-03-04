@@ -7,7 +7,6 @@ on:
 
 env:
   VM_IP: "34.66.51.113"
-  API_PORT: "9090"
 
 jobs:
   deploy:
@@ -27,7 +26,6 @@ jobs:
 
       - name: Deploy API to VM
         run: |
-          # Archive the project
           tar -czf novuscrape-api.tar.gz \
             --exclude='.git' \
             --exclude='.github' \
@@ -35,97 +33,64 @@ jobs:
             --exclude='.venv' \
             .
 
-          # Upload to VM
           scp -o StrictHostKeyChecking=no novuscrape-api.tar.gz \
             ${{ secrets.GCP_USER }}@${{ env.VM_IP }}:/tmp/
 
-          # Deploy on VM
-          ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_USER }}@${{ env.VM_IP }} << 'DEPLOY_EOF'
-            set -e
+          scp -o StrictHostKeyChecking=no deploy/caddy-api.conf \
+            ${{ secrets.GCP_USER }}@${{ env.VM_IP }}:/tmp/caddy-api.conf
 
-            echo "=== Deploying NovuScrape API ==="
+          ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_USER }}@${{ env.VM_IP }} 'bash -s' << 'DEPLOY_EOF'
+          set -e
+          echo "=== Deploying NovuScrape API ==="
 
-            # Install Docker if not present
-            if ! command -v docker &> /dev/null; then
-              echo "Installing Docker..."
-              curl -fsSL https://get.docker.com | sudo sh
-              sudo usermod -aG docker $USER
-              echo "Docker installed. You may need to re-run this workflow."
-            fi
+          if ! command -v docker &> /dev/null; then
+            echo "Installing Docker..."
+            curl -fsSL https://get.docker.com | sudo sh
+            sudo usermod -aG docker $USER
+          fi
 
-            # Create app directory
-            sudo mkdir -p /opt/novuscrape-api
-            sudo chown $USER:$USER /opt/novuscrape-api
+          sudo mkdir -p /opt/novuscrape-api
+          sudo chown $USER:$USER /opt/novuscrape-api
+          cd /opt/novuscrape-api
+          tar -xzf /tmp/novuscrape-api.tar.gz
+          rm /tmp/novuscrape-api.tar.gz
 
-            # Extract new code
-            cd /opt/novuscrape-api
-            tar -xzf /tmp/novuscrape-api.tar.gz
-            rm /tmp/novuscrape-api.tar.gz
+          if [ ! -f .env ]; then
+            API_KEY=$(openssl rand -hex 32)
+            echo "API_KEYS=$API_KEY" > .env
+            echo "RATE_LIMIT=100/minute" >> .env
+            echo "PORT=9090" >> .env
+            echo "Generated API key: $API_KEY"
+          fi
 
-            # Create .env if not exists
-            if [ ! -f .env ]; then
-              API_KEY=$(openssl rand -hex 32)
-              echo "API_KEYS=$API_KEY" > .env
-              echo "RATE_LIMIT=100/minute" >> .env
-              echo "PORT=9090" >> .env
-              echo "Generated API key: $API_KEY"
-              echo "SAVE THIS KEY - it won't be shown again!"
-            fi
+          sudo docker build -t novuscrape-api .
+          sudo docker stop novuscrape-api 2>/dev/null || true
+          sudo docker rm novuscrape-api 2>/dev/null || true
+          sudo docker run -d \
+            --name novuscrape-api \
+            --restart unless-stopped \
+            --env-file .env \
+            -p 127.0.0.1:9090:8000 \
+            novuscrape-api
 
-            # Build and run with Docker
-            sudo docker build -t novuscrape-api .
-            sudo docker stop novuscrape-api 2>/dev/null || true
-            sudo docker rm novuscrape-api 2>/dev/null || true
-            sudo docker run -d \
-              --name novuscrape-api \
-              --restart unless-stopped \
-              --env-file .env \
-              -p 127.0.0.1:9090:8000 \
-              novuscrape-api
+          echo "=== API container started ==="
 
-            echo "=== API container started ==="
+          if ! sudo grep -q "api.novusante.com" /etc/caddy/Caddyfile; then
+            echo "" | sudo tee -a /etc/caddy/Caddyfile
+            cat /tmp/caddy-api.conf | sudo tee -a /etc/caddy/Caddyfile
+            echo "Added api.novusante.com to Caddyfile"
+          fi
+          rm -f /tmp/caddy-api.conf
 
-            # Update Caddy config to add API reverse proxy
-            CADDY_API_BLOCK='
-api.novusante.com {
-    reverse_proxy 127.0.0.1:9090
+          sudo caddy validate --config /etc/caddy/Caddyfile
+          sudo systemctl reload caddy
 
-    header {
-        X-Frame-Options "DENY"
-        X-Content-Type-Options "nosniff"
-        Access-Control-Allow-Origin "*"
-        Access-Control-Allow-Methods "GET, POST, OPTIONS"
-        Access-Control-Allow-Headers "Content-Type, X-Api-Key"
-    }
-
-    encode gzip
-
-    log {
-        output file /var/log/caddy/api.novusante.com.log
-        format json
-    }
-}'
-
-            # Add API block to Caddyfile if not already there
-            if ! sudo grep -q "api.novusante.com" /etc/caddy/Caddyfile; then
-              echo "" | sudo tee -a /etc/caddy/Caddyfile
-              echo "$CADDY_API_BLOCK" | sudo tee -a /etc/caddy/Caddyfile
-              echo "Added api.novusante.com to Caddyfile"
-            fi
-
-            # Validate and reload Caddy
-            sudo caddy validate --config /etc/caddy/Caddyfile
-            sudo systemctl reload caddy
-
-            # Verify API is running
-            sleep 3
-            curl -s http://127.0.0.1:9090/health && echo " - API health check passed!"
-
-            echo "=== Deployment complete ==="
+          sleep 3
+          curl -s http://127.0.0.1:9090/health && echo " - API health check passed!"
+          echo "=== Deployment complete ==="
           DEPLOY_EOF
 
       - name: Verify deployment
         run: |
           sleep 10
-          curl -sf http://${{ env.VM_IP }}:9090/health || echo "Direct port check failed (may be firewalled, check via domain)"
           echo "Deploy workflow complete. Ensure api.novusante.com DNS points to ${{ env.VM_IP }}"
