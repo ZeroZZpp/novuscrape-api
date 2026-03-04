@@ -1,0 +1,131 @@
+name: Deploy NovuScrape API to GCP VM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  VM_IP: "34.66.51.113"
+  API_PORT: "9090"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+
+      - name: Add VM to known hosts
+        run: ssh-keyscan -H ${{ env.VM_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy API to VM
+        run: |
+          # Archive the project
+          tar -czf novuscrape-api.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='__pycache__' \
+            --exclude='.venv' \
+            .
+
+          # Upload to VM
+          scp -o StrictHostKeyChecking=no novuscrape-api.tar.gz \
+            ${{ secrets.GCP_USER }}@${{ env.VM_IP }}:/tmp/
+
+          # Deploy on VM
+          ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_USER }}@${{ env.VM_IP }} << 'DEPLOY_EOF'
+            set -e
+
+            echo "=== Deploying NovuScrape API ==="
+
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              echo "Installing Docker..."
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo usermod -aG docker $USER
+              echo "Docker installed. You may need to re-run this workflow."
+            fi
+
+            # Create app directory
+            sudo mkdir -p /opt/novuscrape-api
+            sudo chown $USER:$USER /opt/novuscrape-api
+
+            # Extract new code
+            cd /opt/novuscrape-api
+            tar -xzf /tmp/novuscrape-api.tar.gz
+            rm /tmp/novuscrape-api.tar.gz
+
+            # Create .env if not exists
+            if [ ! -f .env ]; then
+              API_KEY=$(openssl rand -hex 32)
+              echo "API_KEYS=$API_KEY" > .env
+              echo "RATE_LIMIT=100/minute" >> .env
+              echo "PORT=9090" >> .env
+              echo "Generated API key: $API_KEY"
+              echo "SAVE THIS KEY - it won't be shown again!"
+            fi
+
+            # Build and run with Docker
+            sudo docker build -t novuscrape-api .
+            sudo docker stop novuscrape-api 2>/dev/null || true
+            sudo docker rm novuscrape-api 2>/dev/null || true
+            sudo docker run -d \
+              --name novuscrape-api \
+              --restart unless-stopped \
+              --env-file .env \
+              -p 127.0.0.1:9090:8000 \
+              novuscrape-api
+
+            echo "=== API container started ==="
+
+            # Update Caddy config to add API reverse proxy
+            CADDY_API_BLOCK='
+api.novusante.com {
+    reverse_proxy 127.0.0.1:9090
+
+    header {
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers "Content-Type, X-Api-Key"
+    }
+
+    encode gzip
+
+    log {
+        output file /var/log/caddy/api.novusante.com.log
+        format json
+    }
+}'
+
+            # Add API block to Caddyfile if not already there
+            if ! sudo grep -q "api.novusante.com" /etc/caddy/Caddyfile; then
+              echo "" | sudo tee -a /etc/caddy/Caddyfile
+              echo "$CADDY_API_BLOCK" | sudo tee -a /etc/caddy/Caddyfile
+              echo "Added api.novusante.com to Caddyfile"
+            fi
+
+            # Validate and reload Caddy
+            sudo caddy validate --config /etc/caddy/Caddyfile
+            sudo systemctl reload caddy
+
+            # Verify API is running
+            sleep 3
+            curl -s http://127.0.0.1:9090/health && echo " - API health check passed!"
+
+            echo "=== Deployment complete ==="
+          DEPLOY_EOF
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -sf http://${{ env.VM_IP }}:9090/health || echo "Direct port check failed (may be firewalled, check via domain)"
+          echo "Deploy workflow complete. Ensure api.novusante.com DNS points to ${{ env.VM_IP }}"
